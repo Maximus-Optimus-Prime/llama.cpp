@@ -1,0 +1,28 @@
+{
+  "metadata": {
+    "n_layer": 28,
+    "n_head": 12
+  },
+  "content": [
+    {
+      "n_query": 11,
+      "n_key": 32
+    },
+    {
+      "n_query": 1,
+      "n_key": 32
+    },
+    {
+      "n_query": 1,
+      "n_key": 32
+    },
+    {
+      "n_query": 1,
+      "n_key": 32
+    },
+    {
+      "n_query": 1,
+      "n_key": 32
+    }
+  ]
+}

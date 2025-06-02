@@ -9,6 +9,11 @@
 #include <cmath>
 #include <cstring>
 
+std::vector<AttentionLayerData> g_attention_scores_floats = {};
+bool g_enable_attention_scores_retrieval = false;
+ggml_tensor * last_attention_tensor = nullptr;
+std::vector<ggml_tensor *> g_attention_tensors_per_layer = {};
+
 static int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {
     // TODO move to hparams if a T5 variant appears that uses a different value
     const int64_t max_distance = 128;
@@ -1226,6 +1231,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
+
+        // MY CODE
+        if (g_enable_attention_scores_retrieval) {
+            ggml_tensor *scores_copy = ggml_dup(ctx0, kq);
+            ggml_build_forward_expand(gf, scores_copy);
+            g_attention_tensors_per_layer.push_back(scores_copy);
+        }
+        // END MY CODE
 
         if (!v_trans) {
             // note: avoid this branch

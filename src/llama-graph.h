@@ -10,6 +10,18 @@
 #include <set>
 #include <functional>
 
+// for storing as plain float arrays (layer, head, flattened matrix)
+struct AttentionLayerData {
+    int64_t n_query;  // number of queries
+    int64_t n_key;    // number of keys
+    std::vector<std::vector<float>> head_scores;  // scores per head
+};
+
+extern std::vector<AttentionLayerData> g_attention_scores_floats;
+extern bool g_enable_attention_scores_retrieval;
+extern ggml_tensor * last_attention_tensor;
+extern std::vector<ggml_tensor *> g_attention_tensors_per_layer;
+
 struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;

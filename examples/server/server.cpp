@@ -31,6 +31,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "llama-graph.h" // MY CODE
+
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
@@ -65,8 +67,11 @@ enum server_task_type {
     SERVER_TASK_TYPE_NEXT_RESPONSE,
     SERVER_TASK_TYPE_METRICS,
     SERVER_TASK_TYPE_SLOT_SAVE,
+    SERVER_TASK_TYPE_SLOT_SAVE_JSON,
+    SERVER_TASK_TYPE_SLOT_SAVE_HEAD,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_SLOT_EVICT,
     SERVER_TASK_TYPE_SET_LORA,
 };
 
@@ -199,13 +204,20 @@ struct server_task {
     llama_tokens prompt_tokens;
     int id_selected_slot = -1;
 
-    // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE
+    // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE, SERVER_TASK_TYPE_SLOT_SAVE_JSON, SERVER_TASK_TYPE_SLOT_SAVE_HEAD
     struct slot_action {
         int slot_id;
         std::string filename;
         std::string filepath;
     };
     slot_action slot_action;
+
+    // used by SERVER_TASK_TYPE_SLOT_EVICT
+    struct slot_action_evict {
+        int slot_id;
+        json pairs;
+    };
+    slot_action_evict slot_action_evict;
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
@@ -608,6 +620,7 @@ struct server_task_result_cmpl_final : server_task_result {
     bool stream;
     result_timings timings;
     std::string prompt;
+    json cache_map;
 
     bool truncated;
     int32_t n_decoded;
@@ -668,6 +681,7 @@ struct server_task_result_cmpl_final : server_task_result {
             {"stop_type",           stop_type_to_str(stop)},
             {"stopping_word",       stopping_word},
             {"tokens_cached",       n_tokens_cached},
+            {"cache_map",           cache_map},
             {"timings",             timings.to_json()},
         };
         if (!stream && !probs_output.empty()) {
@@ -1200,6 +1214,72 @@ struct server_task_result_slot_save_load : server_task_result {
     }
 };
 
+struct server_task_result_slot_save_load_head : server_task_result {
+    std::string filename;
+    bool is_saved; // true = send, false = save
+
+    json metadata;
+    json content;
+    double t_ms;
+
+
+    virtual json to_json() override {
+        if (is_saved) {
+            return json {
+                { "id_slot",    id_slot },
+                { "is_saved", is_saved },
+                { "filename",   filename },
+                { "timings", {
+                    { "restore_ms", t_ms }
+                }},
+            };
+        } else {
+            return json {
+                { "id_slot",    id_slot },
+                { "is_saved", is_saved },
+                { "metadata", metadata },
+                { "content", content },
+                { "timings", {
+                    { "save_ms", t_ms }
+                }},
+            };
+        }
+    }
+};
+
+struct server_task_result_slot_save_load_json : server_task_result {
+    std::string filename;
+    bool is_saved; // true = save, false = load
+
+    size_t n_tokens;
+    json tokens;
+    double t_ms;
+
+
+    virtual json to_json() override {
+        if (is_saved) {
+            return json {
+                { "id_slot",    id_slot },
+                { "is_saved", is_saved },
+                { "filename",   filename },
+                { "n_restored", n_tokens },
+                { "timings", {
+                    { "restore_ms", t_ms }
+                }},
+            };
+        } else {
+            return json {
+                { "id_slot",    id_slot },
+                { "is_saved", is_saved },
+                { "tokens", tokens },
+                { "timings", {
+                    { "save_ms", t_ms }
+                }},
+            };
+        }
+    }
+};
+
 struct server_task_result_slot_erase : server_task_result {
     size_t n_erased;
 
@@ -1207,6 +1287,17 @@ struct server_task_result_slot_erase : server_task_result {
         return json {
             { "id_slot",  id_slot },
             { "n_erased", n_erased },
+        };
+    }
+};
+
+struct server_task_result_slot_evict : server_task_result {
+    size_t n_evict;
+
+    virtual json to_json() override {
+        return json {
+            { "id_slot",  id_slot },
+            { "n_evict", n_evict },
         };
     }
 };
@@ -1257,7 +1348,7 @@ struct server_slot {
 
     // input prompt tokens
     llama_tokens prompt_tokens;
-
+    json cache_map;
     size_t last_nl_pos = 0;
 
     std::string  generated_text;
@@ -1924,7 +2015,7 @@ struct server_context {
             slot.ctx = ctx;
             slot.n_ctx = n_ctx_slot;
             slot.n_predict = params_base.n_predict;
-
+            slot.cache_map = json::array();
             if (model_dft) {
                 slot.batch_spec = llama_batch_init(params_base.speculative.n_max + 1, 0, 1);
 
@@ -2059,7 +2150,7 @@ struct server_context {
         slot.task_type     = task.type;
         slot.params        = std::move(task.params);
         slot.prompt_tokens = std::move(task.prompt_tokens);
-
+        slot.cache_map = json::array();
         if (!are_lora_equal(task.params.lora, slot.lora)) {
             // if lora is changed, we cannot reuse cached tokens
             slot.cache_tokens.clear();
@@ -2386,6 +2477,8 @@ struct server_context {
         res->oaicompat_model       = slot.params.oaicompat_model;
         res->oaicompat_cmpl_id     = slot.params.oaicompat_cmpl_id;
         res->oaicompat_chat_format = slot.params.oaicompat_chat_format;
+
+        res->cache_map = slot.cache_map;
         // populate res.probs_output
         if (slot.params.sampling.n_probs > 0) {
             if (!slot.params.stream && slot.stop == STOP_TYPE_WORD) {
@@ -2580,9 +2673,39 @@ struct server_context {
         }
     }
 
+    // Save attention scores to CSV file
+    json save_attention_scores() {
+        json retrieval_score;
+        std::string bin_path = "cache/attention_scores.bin";
+        std::ofstream bin_file(bin_path, std::ios::binary);
+        retrieval_score["metadata"] = {};
+        int n_layer = llama_model_n_layer(model);
+        retrieval_score["metadata"]["n_layer"] = n_layer;
+        retrieval_score["metadata"]["n_head"] = llama_model_n_head(model);
+        retrieval_score["content"] = json::array();
+        for (size_t layer = 0; layer < g_attention_scores_floats.size(); layer++) {
+            if (layer % n_layer == 0) {
+                retrieval_score["content"].push_back({
+                    {"n_query", g_attention_scores_floats[layer].n_query},
+                    {"n_key", g_attention_scores_floats[layer].n_key}
+                });
+            }
+            const auto& layer_data = g_attention_scores_floats[layer];
+            for (size_t head = 0; head < layer_data.head_scores.size(); head++) {
+                const auto& head_scores = layer_data.head_scores[head];
+                bin_file.write(reinterpret_cast<const char*>(head_scores.data()), 
+                head_scores.size() * sizeof(float));
+            }
+        }
+        bin_file.close();
+        printf("Attention scores saved to %s\n", bin_path.c_str());
+        return retrieval_score;
+    }
+
     //
     // Functions to process the task
     //
+    
 
     void process_single_task(server_task task) {
         switch (task.type) {
@@ -2696,7 +2819,6 @@ struct server_context {
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
-
                     const size_t nwrite = llama_state_seq_save_file(ctx, filepath.c_str(), slot->id, slot->cache_tokens.data(), token_count);
 
                     const int64_t t_end = ggml_time_us();
@@ -2709,6 +2831,70 @@ struct server_context {
                     res->is_save  = true;
                     res->n_tokens = token_count;
                     res->n_bytes  = nwrite;
+                    res->t_ms     = t_save_ms;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_SAVE_JSON:
+                {
+                    int id_slot = task.slot_action.slot_id;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        // if requested slot is unavailable, we defer this task for processing later
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(task);
+                        break;
+                    }
+                    const size_t token_count = slot->cache_tokens.size();
+                    const int64_t t_start = ggml_time_us();
+                    std::string filename = task.slot_action.filename;
+                    std::string filepath = task.slot_action.filepath;
+                    std::ofstream file;
+                    bool is_saved = false;
+                    if (filename != ""){
+                        is_saved = true;
+                        file.open(filepath);
+                        if (!file.is_open()) {
+                            send_error(task, "Failed to open file for writing", ERROR_TYPE_SERVER);
+                            break;
+                        }
+                    }
+                    // Create the JSON structure for storing tokens
+                    json tokens_json = json::array();
+                    // Convert each token to its JSON representation
+                    for (size_t i = 0; i < token_count; i++) {
+                        const llama_token token = slot->cache_tokens[i];
+                        std::string piece = common_token_to_piece(ctx, token);
+                        tokens_json.push_back({
+                            {"key", token},
+                            {"value", piece},
+                            {"position", i}
+                        });
+                    }
+                    // Create the full JSON object with metadata
+                    json cache_data = {
+                        {"id_slot", id_slot},
+                        {"token_count", token_count},
+                        {"tokens", tokens_json}
+                    };
+                    // Write the JSON to the file with pretty formatting (indent of 2 spaces)
+                    if (filename != "") {
+                        file << cache_data.dump(2);
+                        file.close();
+                    }
+                    const int64_t t_end = ggml_time_us();
+                    const double t_save_ms = (t_end - t_start) / 1000.0;
+
+                    auto res = std::make_unique<server_task_result_slot_save_load_json>();
+                    res->id       = task.id;
+                    res->id_slot  = id_slot;
+                    res->filename = filename;
+                    res->is_saved  = is_saved;
+                    res->n_tokens = token_count;
+                    res->tokens  = cache_data;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -2779,6 +2965,107 @@ struct server_context {
                     res->id       = task.id;
                     res->id_slot  = id_slot;
                     res->n_erased = n_erased;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_EVICT:
+                {
+                    int id_slot = task.slot_action_evict.slot_id;
+                    const auto& pairs = task.slot_action_evict.pairs;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        // if requested slot is unavailable, we defer this task for processing later
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(task);
+                        break;
+                    }
+                    size_t n_evict = 0;
+                    for (const auto& pair : pairs) {
+                        if (pair.contains("token")) {
+                            std::string token = pair.at("token").get<std::string>();
+                            size_t occ = pair.at("occurence").get<size_t>();
+                            size_t n_occ = 0;
+                            for (size_t i = 0; i < slot->cache_tokens.size(); ++i) {
+                                const llama_token evicted_token = slot->cache_tokens[i];
+                                std::string piece = common_token_to_piece(ctx, evicted_token);
+                                if (token == piece) {
+                                    n_occ++;
+                                    if (n_occ == occ) {
+                                        n_evict++;
+                                        //SRV_INF("token: %s | pos : %zu\n", token.c_str(), n_occ);
+                                        slot->cache_tokens.erase(slot->cache_tokens.begin() + i);
+                                        llama_kv_self_seq_rm (ctx, slot->id, i, i + 1);
+                                        llama_kv_self_seq_add(ctx, slot->id, i + 1, -1, -1);
+                                        n_occ = 0;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        else if (pair.contains("start")) {
+                            size_t start = pair.at("start").get<size_t>();
+                            size_t end = pair.at("end").get<size_t>();
+                            if (end > start) {
+                                n_evict += end - start;
+                                slot->cache_tokens.erase(slot->cache_tokens.begin() + start, slot->cache_tokens.begin() + end);
+                                llama_kv_self_seq_rm(ctx, slot->id, start, end);
+                                llama_kv_self_seq_add(ctx, slot->id, start + end, -1, end - start);
+                            }
+                        }
+                    }
+
+                    auto res = std::make_unique<server_task_result_slot_evict>();
+                    res->id       = task.id;
+                    res->id_slot  = id_slot;
+                    res->n_evict = n_evict;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_SAVE_HEAD:
+                {
+                    int id_slot = task.slot_action.slot_id;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        // if requested slot is unavailable, we defer this task for processing later
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(task);
+                        break;
+                    }
+                    const int64_t t_start = ggml_time_us();
+                    std::string filename = task.slot_action.filename;
+                    std::string filepath = task.slot_action.filepath;
+                    std::ofstream file;
+                    bool is_saved = false;
+                    if (filename != ""){
+                        is_saved = true;
+                        file.open(filepath);
+                        if (!file.is_open()) {
+                            send_error(task, "Failed to open file for writing", ERROR_TYPE_SERVER);
+                            break;
+                        }
+                    }
+                    json data = save_attention_scores();
+                    // Write the JSON to the file with pretty formatting (indent of 2 spaces)
+                    if (filename != "") {
+                        file << data.dump(2);
+                        file.close();
+                    }
+                    const int64_t t_end = ggml_time_us();
+                    const double t_save_ms = (t_end - t_start) / 1000.0;
+                    auto res = std::make_unique<server_task_result_slot_save_load_head>();
+                    res->id       = task.id;
+                    res->id_slot  = id_slot;
+                    res->filename = filename;
+                    res->is_saved  = is_saved;
+                    res->metadata = data["metadata"];   
+                    res->content  = data["content"];
+                    res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SET_LORA:
@@ -2916,6 +3203,9 @@ struct server_context {
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
+                        g_attention_scores_floats.clear(); // MY CODE
+                        g_enable_attention_scores_retrieval = true; // MY CODE
+
                         slot.t_start_process_prompt = ggml_time_us();
                         slot.t_start_generation = 0;
 
@@ -2923,7 +3213,7 @@ struct server_context {
                         slot.n_prompt_tokens = prompt_tokens.size();
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
-                        SLT_INF(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, n_prompt_tokens = %d\n", slot.n_ctx, slot.params.n_keep, slot.n_prompt_tokens);
+                        SLT_DBG(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, n_prompt_tokens = %d\n", slot.n_ctx, slot.params.n_keep, slot.n_prompt_tokens);
 
                         // print prompt tokens (for debugging)
                         if (1) {
@@ -2998,14 +3288,15 @@ struct server_context {
                                 slot.n_prompt_tokens = prompt_tokens.size();
 
                                 SLT_WRN(slot, "input truncated, n_ctx = %d, n_keep = %d, n_left = %d, n_prompt_tokens = %d\n", slot.n_ctx, slot.params.n_keep, n_left, slot.n_prompt_tokens);
-
+                                /*for (size_t i = 0; i < prompt_tokens.size(); i++) {
+                                    SLT_INF(slot, "token %d: '%s'\n", prompt_tokens[i], common_token_to_piece(ctx, prompt_tokens[i]).c_str());
+                                }*/
                                 GGML_ASSERT(slot.n_prompt_tokens < slot.n_ctx);
                             }
-
                             if (slot.params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 slot.n_past = common_lcp(slot.cache_tokens, prompt_tokens);
-
+                                slot.cache_map.push_back(slot.n_past);
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
                                 if (params_base.n_cache_reuse > 0) {
                                     size_t head_c = slot.n_past; // cache
@@ -3025,7 +3316,7 @@ struct server_context {
                                         }
 
                                         if (n_match >= (size_t) params_base.n_cache_reuse) {
-                                            SLT_INF(slot, "reusing chunk with size %zu, shifting KV cache [%zu, %zu) -> [%zu, %zu)\n", n_match, head_c, head_c + n_match, head_p, head_p + n_match);
+                                            SLT_DBG(slot, "reusing chunk with size %zu, shifting KV cache [%zu, %zu) -> [%zu, %zu)\n", n_match, head_c, head_c + n_match, head_p, head_p + n_match);
                                             //for (size_t i = head_p; i < head_p + n_match; i++) {
                                             //    SLT_DBG(slot, "cache token %3zu: %6d '%s'\n", i, prompt_tokens[i], common_token_to_piece(ctx, prompt_tokens[i]).c_str());
                                             //}
@@ -3042,8 +3333,10 @@ struct server_context {
 
                                             head_c += n_match;
                                             head_p += n_match;
+                                            slot.cache_map.push_back(n_match);
                                         } else {
                                             head_c += 1;
+                                            slot.cache_map.push_back(0);
                                         }
                                     }
 
@@ -3099,7 +3392,7 @@ struct server_context {
                         slot.n_past++;
                     }
 
-                    SLT_INF(slot, "prompt processing progress, n_past = %d, n_tokens = %d, progress = %f\n", slot.n_past, batch.n_tokens, (float) slot.n_prompt_tokens_processed / slot.n_prompt_tokens);
+                    SLT_DBG(slot, "prompt processing progress, n_past = %d, n_tokens = %d, progress = %f\n", slot.n_past, batch.n_tokens, (float) slot.n_prompt_tokens_processed / slot.n_prompt_tokens);
 
                     // entire prompt has been processed
                     if (slot.n_past == slot.n_prompt_tokens) {
@@ -3301,7 +3594,6 @@ struct server_context {
                 }
 
                 SLT_DBG(slot, "decoding speculative batch, size = %d\n", slot.batch_spec.n_tokens);
-
                 llama_decode(ctx, slot.batch_spec);
 
                 // the accepted tokens from the speculation
@@ -3326,6 +3618,7 @@ struct server_context {
 
                     if (!process_token(result, slot)) {
                         // release slot because of stop condition
+                        g_enable_attention_scores_retrieval = false;
                         slot.release();
                         slot.print_timings();
                         send_final_response(slot);
@@ -3341,6 +3634,8 @@ struct server_context {
         SRV_DBG("%s", "run slots completed\n");
     }
 
+
+
     json model_meta() const {
         return json {
             {"vocab_type",  llama_vocab_type       (vocab)},
@@ -3352,6 +3647,7 @@ struct server_context {
         };
     }
 };
+
 
 static void log_server_request(const httplib::Request & req, const httplib::Response & res) {
     // skip GH copilot requests when using default port
@@ -3674,6 +3970,10 @@ int main(int argc, char ** argv) {
                     {"help",  "KV-cache tokens."},
                     {"value",  (uint64_t) res_metrics->kv_cache_tokens_count}
             },{
+                    {"name",  "kv_cache_used_cells"},
+                    {"help",  "KV-cache used cells."},
+                    {"value",  (uint64_t) res_metrics->kv_cache_used_cells}
+            },{
                     {"name",  "requests_processing"},
                     {"help",  "Number of requests processing."},
                     {"value",  (uint64_t) res_metrics->n_processing_slots}
@@ -3715,8 +4015,71 @@ int main(int argc, char ** argv) {
             return;
         }
         std::string filepath = params.slot_save_path + filename;
-
         server_task task(SERVER_TASK_TYPE_SLOT_SAVE);
+        task.id = ctx_server.queue_tasks.get_new_id();
+        task.slot_action.slot_id  = id_slot;
+        task.slot_action.filename = filename;
+        task.slot_action.filepath = filepath;
+
+        ctx_server.queue_results.add_waiting_task_id(task.id);
+        ctx_server.queue_tasks.post(task);
+
+        server_task_result_ptr result = ctx_server.queue_results.recv(task.id);
+        ctx_server.queue_results.remove_waiting_task_id(task.id);
+
+        if (result->is_error()) {
+            res_error(res, result->to_json());
+            return;
+        }
+
+        res_ok(res, result->to_json());
+    };
+
+    const auto handle_slots_save_json = [&ctx_server, &res_error, &res_ok, &params](const httplib::Request & req, httplib::Response & res, int id_slot) {
+        std::string filename = "";
+        std::string filepath = "";
+        if (!req.body.empty()) {
+            json request_data = json::parse(req.body);
+            filename = request_data.at("filename");
+            if (!fs_validate_filename(filename)) {
+                res_error(res, format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            filepath = params.slot_save_path + filename;
+        }
+        server_task task(SERVER_TASK_TYPE_SLOT_SAVE_JSON);
+        task.id = ctx_server.queue_tasks.get_new_id();
+        task.slot_action.slot_id  = id_slot;
+        task.slot_action.filename = filename;
+        task.slot_action.filepath = filepath;
+
+        ctx_server.queue_results.add_waiting_task_id(task.id);
+        ctx_server.queue_tasks.post(task);
+
+        server_task_result_ptr result = ctx_server.queue_results.recv(task.id);
+        ctx_server.queue_results.remove_waiting_task_id(task.id);
+
+        if (result->is_error()) {
+            res_error(res, result->to_json());
+            return;
+        }
+
+        res_ok(res, result->to_json());
+    };
+
+    const auto handle_slots_save_head = [&ctx_server, &res_error, &res_ok, &params](const httplib::Request & req, httplib::Response & res, int id_slot) {
+        std::string filename = "";
+        std::string filepath = "";
+        if (!req.body.empty()) {
+            json request_data = json::parse(req.body);
+            filename = request_data.at("filename");
+            if (!fs_validate_filename(filename)) {
+                res_error(res, format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            filepath = params.slot_save_path + filename;
+        }
+        server_task task(SERVER_TASK_TYPE_SLOT_SAVE_HEAD);
         task.id = ctx_server.queue_tasks.get_new_id();
         task.slot_action.slot_id  = id_slot;
         task.slot_action.filename = filename;
@@ -3786,7 +4149,30 @@ int main(int argc, char ** argv) {
         res_ok(res, result->to_json());
     };
 
-    const auto handle_slots_action = [&params, &res_error, &handle_slots_save, &handle_slots_restore, &handle_slots_erase](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_slots_evict = [&ctx_server, &res_error, &res_ok](const httplib::Request & req, httplib::Response & res, int id_slot) {
+        server_task task(SERVER_TASK_TYPE_SLOT_EVICT);
+        task.id = ctx_server.queue_tasks.get_new_id();
+
+        json request_data = json::parse(req.body);
+        const auto& pairs = request_data.at("pairs");
+
+        task.slot_action_evict.slot_id = id_slot;
+        task.slot_action_evict.pairs = pairs;
+        ctx_server.queue_results.add_waiting_task_id(task.id);
+        ctx_server.queue_tasks.post(task);
+
+        server_task_result_ptr result = ctx_server.queue_results.recv(task.id);
+        ctx_server.queue_results.remove_waiting_task_id(task.id);
+
+        if (result->is_error()) {
+            res_error(res, result->to_json());
+            return;
+        }
+
+        res_ok(res, result->to_json());
+    };
+
+    const auto handle_slots_action = [&params, &res_error, &handle_slots_save, &handle_slots_restore, &handle_slots_erase, &handle_slots_save_json, &handle_slots_save_head, &handle_slots_evict](const httplib::Request & req, httplib::Response & res) {
         if (params.slot_save_path.empty()) {
             res_error(res, format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
             return;
@@ -3810,6 +4196,12 @@ int main(int argc, char ** argv) {
             handle_slots_restore(req, res, id_slot);
         } else if (action == "erase") {
             handle_slots_erase(req, res, id_slot);
+        } else if (action == "save_json") {
+            handle_slots_save_json(req, res, id_slot);
+        } else if (action == "save_head") {
+            handle_slots_save_head(req, res, id_slot);
+        } else if (action == "evict") {
+            handle_slots_evict(req, res, id_slot);
         } else {
             res_error(res, format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
         }
@@ -3869,8 +4261,7 @@ int main(int argc, char ** argv) {
         try {
             const auto & prompt = data.at("prompt");
             // TODO: this log can become very long, put it behind a flag or think about a more compact format
-            //SRV_DBG("Prompt: %s\n", prompt.is_string() ? prompt.get<std::string>().c_str() : prompt.dump(2).c_str());
-
+            SRV_DBG("Prompt: %s\n", prompt.is_string() ? prompt.get<std::string>().c_str() : prompt.dump(2).c_str());
             std::vector<llama_tokens> tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, prompt, true, true);
             tasks.reserve(tokenized_prompts.size());
             for (size_t i = 0; i < tokenized_prompts.size(); i++) {
@@ -4136,6 +4527,94 @@ int main(int argc, char ** argv) {
 
         const json data = format_tokenizer_response(tokens_response);
         res_ok(res, data);
+    };
+
+    const auto handle_tokenize_infill = [&ctx_server, &res_ok, &res_error](const httplib::Request & req, httplib::Response & res) {
+        // check model compatibility
+        std::string err;
+        if (llama_vocab_fim_pre(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
+            err += "prefix token is missing. ";
+        }
+        if (llama_vocab_fim_suf(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
+            err += "suffix token is missing. ";
+        }
+        if (llama_vocab_fim_mid(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
+            err += "middle token is missing. ";
+        }
+        if (!err.empty()) {
+            res_error(res, format_error_response(string_format("Infill is not supported by this model: %s", err.c_str()), ERROR_TYPE_NOT_SUPPORTED));
+            return;
+        }
+        json data = json::parse(req.body);
+        // validate input
+        if (data.contains("prompt") && !data.at("prompt").is_string()) {
+            // prompt is optional
+            res_error(res, format_error_response("\"prompt\" must be a string", ERROR_TYPE_INVALID_REQUEST));
+        }
+        if (!data.contains("input_prefix")) {
+            res_error(res, format_error_response("\"input_prefix\" is required", ERROR_TYPE_INVALID_REQUEST));
+        }
+        if (!data.contains("input_suffix")) {
+            res_error(res, format_error_response("\"input_suffix\" is required", ERROR_TYPE_INVALID_REQUEST));
+        }
+        if (data.contains("input_extra") && !data.at("input_extra").is_array()) {
+            // input_extra is optional
+            res_error(res, format_error_response("\"input_extra\" must be an array of {\"filename\": string, \"text\": string}", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        json input_extra = json_value(data, "input_extra", json::array());
+        for (const auto & chunk : input_extra) {
+            // { "text": string, "filename": string }
+            if (!chunk.contains("text") || !chunk.at("text").is_string()) {
+                res_error(res, format_error_response("extra_context chunk must contain a \"text\" field with a string value", ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            // filename is optional
+            if (chunk.contains("filename") && !chunk.at("filename").is_string()) {
+                res_error(res, format_error_response("extra_context chunk's \"filename\" field must be a string", ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+        }
+        data["input_extra"] = input_extra; // default to empty array if it's not exist
+        std::string prompt = json_value(data, "prompt", std::string());
+        std::vector<llama_tokens> tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, prompt, false, true);
+        data["prompt"] = format_infill(
+            ctx_server.vocab,
+            data.at("input_prefix"),
+            data.at("input_suffix"),
+            data.at("input_extra"),
+            ctx_server.params_base.n_batch,
+            ctx_server.params_base.n_predict,
+            ctx_server.slots[0].n_ctx, // TODO: there should be a better way
+            ctx_server.params_base.spm_infill,
+            tokenized_prompts[0]
+        );
+        std::vector<llama_tokens> formatted_tokens = tokenize_input_prompts(ctx_server.vocab, data.at("prompt"), true, true);
+        // Convert tokenized_prompts to JSON with both token IDs and text
+        json tokens_response = {};
+        for (size_t i = 0; i < formatted_tokens.size(); i++) {
+            json tokens_array = json::array();
+            for (const auto& token : formatted_tokens[i]) {
+                std::string piece = common_token_to_piece(ctx_server.ctx, token);
+                json piece_json;
+                // Check if the piece is valid UTF-8
+                if (is_valid_utf8(piece)) {
+                    piece_json = piece;
+                } else {
+                    // If not valid UTF-8, store as array of byte values
+                    piece_json = json::array();
+                    for (unsigned char c : piece) {
+                        piece_json.push_back(static_cast<int>(c));
+                    }
+                }
+                tokens_array.push_back({
+                    {"id", token},
+                    {"piece", piece_json}
+                });
+            }
+            tokens_response["prompt_" + std::to_string(i)] = tokens_array;
+        }
+        res_ok(res, tokens_response);
     };
 
     const auto handle_detokenize = [&ctx_server, &res_ok](const httplib::Request & req, httplib::Response & res) {
@@ -4428,6 +4907,7 @@ int main(int argc, char ** argv) {
     svr->Post("/v1/rerank",           handle_rerank);
     svr->Post("/v1/reranking",        handle_rerank);
     svr->Post("/tokenize",            handle_tokenize);
+    svr->Post("/tokenize_infill",     handle_tokenize_infill);
     svr->Post("/detokenize",          handle_detokenize);
     svr->Post("/apply-template",      handle_apply_template);
     // LoRA adapters hotswap

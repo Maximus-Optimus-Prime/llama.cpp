@@ -1331,6 +1331,7 @@ int llama_context::decode(llama_batch & inp_batch) {
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
+       
         auto * gf = graph_init();
         auto res = graph_build(ctx_compute.get(), gf, ubatch, LLM_GRAPH_TYPE_DECODER);
 
@@ -1341,6 +1342,35 @@ int llama_context::decode(llama_batch & inp_batch) {
         res->set_inputs(&ubatch);
 
         const auto compute_status = graph_compute(gf, ubatch.n_tokens > 1);
+
+        // MY CODE
+        if (g_enable_attention_scores_retrieval) {
+            for (size_t l = 0; l < g_attention_tensors_per_layer.size(); ++l)
+            {                
+                ggml_tensor * attn = g_attention_tensors_per_layer[l];
+                if (!attn || !attn->buffer) continue;
+                int64_t n_head = attn->ne[2];
+                int64_t n_query = attn->ne[1];
+                int64_t n_key = attn->ne[0];
+                std::vector<float> temp_buffer(n_head * n_query * n_key);
+                ggml_backend_tensor_get(attn, temp_buffer.data(), 0, temp_buffer.size() * sizeof(float));
+                float* data = temp_buffer.data();
+                AttentionLayerData layer_data;
+                layer_data.n_query = n_query;
+                layer_data.n_key = n_key;
+                for (int64_t h = 0; h < n_head; ++h) {
+                    std::vector<float> head_scores(n_query * n_key);
+                    for (int64_t i = 0; i < n_query * n_key; ++i) {
+                        head_scores[i] = data[h * n_query * n_key + i];
+                    }
+                    layer_data.head_scores.push_back(std::move(head_scores));
+                }
+                g_attention_scores_floats.push_back(std::move(layer_data));
+            }
+            g_attention_tensors_per_layer.clear();
+        }
+        // END MY CODE
+
         if (compute_status != GGML_STATUS_SUCCESS) {
             switch (compute_status) {
                 case GGML_STATUS_ABORTED:
