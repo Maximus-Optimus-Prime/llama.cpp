@@ -1187,6 +1187,17 @@ public:
         tokens.clear();
     }
 
+    // MY CODE
+    void erase(size_t p1, size_t p2) {
+        GGML_ASSERT(p1 <= p2 && p2 <= tokens.size());
+        if (p2 == 0){
+            tokens.erase(tokens.begin() + p1);
+        }
+        else {
+            tokens.erase(tokens.begin() + p1, tokens.begin() + p2);
+        }
+    }
+
     void keep_first(size_t n) {
         GGML_ASSERT(n <= tokens.size());
         if (has_mtmd) {

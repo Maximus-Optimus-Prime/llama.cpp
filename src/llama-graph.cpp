@@ -12,6 +12,11 @@
 #include <cmath>
 #include <cstring>
 
+std::vector<AttentionLayerData> g_attention_scores_floats = {};
+bool g_enable_attention_scores_retrieval = false;
+std::vector<ggml_tensor *> g_attention_tensors_per_layer = {};
+
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1136,6 +1141,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
+
+        // MY CODE
+        if (g_enable_attention_scores_retrieval) {
+            ggml_tensor *scores_copy = ggml_dup(ctx0, kq);
+            ggml_build_forward_expand(gf, scores_copy);
+            g_attention_tensors_per_layer.push_back(scores_copy);
+        }
+        // END MY CODE
 
         if (!v_trans) {
             // note: avoid this branch
