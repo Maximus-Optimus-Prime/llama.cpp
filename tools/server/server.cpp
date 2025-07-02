@@ -2034,25 +2034,25 @@ struct server_context {
     // Save attention scores to CSV file
     json save_attention_scores() {
         json retrieval_score;
-        std::string bin_path = "cache/attention_scores.bin";
+        const std::string bin_path = "cache/attention_scores.bin";
         std::ofstream bin_file(bin_path, std::ios::binary);
         retrieval_score["metadata"] = {};
-        int n_layer = llama_model_n_layer(model);
+        const int n_layer = llama_model_n_layer(model);
         retrieval_score["metadata"]["n_layer"] = n_layer;
         retrieval_score["metadata"]["n_head"] = llama_model_n_head(model);
-        retrieval_score["content"] = json::array();
+        json& content = retrieval_score["content"];
+        content = json::array();
         for (size_t layer = 0; layer < g_attention_scores_floats.size(); layer++) {
             if (layer % n_layer == 0) {
-                retrieval_score["content"].push_back({
-                    {"n_query", g_attention_scores_floats[layer].n_query},
-                    {"n_key", g_attention_scores_floats[layer].n_key}
+                const auto& layer_data = g_attention_scores_floats[layer];
+                content.push_back({
+                    {"n_query", layer_data.n_query},
+                    {"n_key", layer_data.n_key}
                 });
             }
             const auto& layer_data = g_attention_scores_floats[layer];
-            for (size_t head = 0; head < layer_data.head_scores.size(); head++) {
-                const auto& head_scores = layer_data.head_scores[head];
-                bin_file.write(reinterpret_cast<const char*>(head_scores.data()), 
-                head_scores.size() * sizeof(float));
+            for (const auto& head_scores : layer_data.head_scores) {
+                bin_file.write(reinterpret_cast<const char*>(head_scores.data()), head_scores.size() * sizeof(float));
             }
         }
         bin_file.close();
