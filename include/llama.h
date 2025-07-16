@@ -334,6 +334,7 @@ extern "C" {
     struct llama_context_params {
         uint32_t n_ctx;             // text context, 0 = from model
         uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
+        uint16_t g_attn;            // MY CODE
         uint32_t n_ubatch;          // physical maximum batch size
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         int32_t  n_threads;         // number of threads to use for generation

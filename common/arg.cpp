@@ -1436,6 +1436,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_PREDICT"));
     add_opt(common_arg(
+        {"-attn"}, "N",
+        string_format("get the attention scores (default: %d, 0 = No, 1 = Yes)", params.g_attn),
+        [](common_params & params, int value) {
+            params.g_attn = value;
+        }
+    ).set_env("LLAMA_ARG_ATTN_SCORE"));  // MY CODE
+    add_opt(common_arg(
         {"-b", "--batch-size"}, "N",
         string_format("logical maximum batch size (default: %d)", params.n_batch),
         [](common_params & params, int value) {

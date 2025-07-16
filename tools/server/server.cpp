@@ -1368,6 +1368,7 @@ struct server_slot {
     int32_t n_remaining = -1;
     int32_t i_batch     = -1;
     int32_t n_predict   = -1; // TODO: disambiguate from params.n_predict
+    int32_t g_attn      = 0; // MY CODE
 
     // n_prompt_tokens may not be equal to prompt_tokens.size(), because prompt maybe truncated
     int32_t n_prompt_tokens           = 0;
@@ -2036,27 +2037,32 @@ struct server_context {
         json retrieval_score;
         const std::string bin_path = "cache/attention_scores.bin";
         std::ofstream bin_file(bin_path, std::ios::binary);
-        retrieval_score["metadata"] = {};
+        if (!bin_file.is_open()) {
+            throw std::runtime_error("Failed to open attention_scores.bin for writing");
+        }
         const int n_layer = llama_model_n_layer(model);
-        retrieval_score["metadata"]["n_layer"] = n_layer;
-        retrieval_score["metadata"]["n_head"] = llama_model_n_head(model);
-        json& content = retrieval_score["content"];
-        content = json::array();
-        for (size_t layer = 0; layer < g_attention_scores_floats.size(); layer++) {
+        const int n_head = llama_model_n_head(model);
+        retrieval_score["metadata"] = {
+            {"n_layer", n_layer},
+            {"n_head", n_head}
+        };
+        json content = json::array();
+        for (size_t layer = 0; layer < g_attention_scores_floats.size(); ++layer) {
+            const auto& layer_data = g_attention_scores_floats[layer];
             if (layer % n_layer == 0) {
-                const auto& layer_data = g_attention_scores_floats[layer];
                 content.push_back({
                     {"n_query", layer_data.n_query},
                     {"n_key", layer_data.n_key}
                 });
             }
-            const auto& layer_data = g_attention_scores_floats[layer];
             for (const auto& head_scores : layer_data.head_scores) {
                 bin_file.write(reinterpret_cast<const char*>(head_scores.data()), head_scores.size() * sizeof(float));
             }
         }
         bin_file.close();
         g_attention_scores_floats.clear();
+        g_attention_scores_floats.shrink_to_fit();
+        retrieval_score["content"] = std::move(content);
         return retrieval_score;
     }
 
@@ -2187,6 +2193,7 @@ struct server_context {
             slot.ctx = ctx;
             slot.n_ctx = n_ctx_slot;
             slot.n_predict = params_base.n_predict;
+            slot.g_attn = params_base.g_attn; // MY CODE
             slot.mctx = mctx;
             slot.cache_tokens.has_mtmd = mctx != nullptr;
 
@@ -3389,8 +3396,11 @@ struct server_context {
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
-                        g_attention_scores_floats.clear(); // MY CODE
-                        g_enable_attention_scores_retrieval = true; // MY CODE
+                        if (slot.g_attn > 0) { // MY CODE
+                            g_attention_scores_floats.clear();
+                            g_attention_scores_floats.shrink_to_fit();
+                            g_enable_attention_scores_retrieval = true;
+                        } // END MY CODE
                         slot.t_start_process_prompt = ggml_time_us();
                         slot.t_start_generation = 0;
 
@@ -3836,6 +3846,9 @@ struct server_context {
                 }
 
                 if (!process_token(result, slot)) {
+                    if (slot.g_attn > 0) { // MY CODE
+                        g_enable_attention_scores_retrieval = false;
+                    }
                     // release slot because of stop condition
                     slot.release();
                     slot.print_timings();
@@ -3936,7 +3949,6 @@ struct server_context {
 
                     if (!process_token(result, slot)) {
                         // release slot because of stop condition
-                        g_enable_attention_scores_retrieval = false;
                         slot.release();
                         slot.print_timings();
                         send_final_response(slot);
@@ -3944,11 +3956,9 @@ struct server_context {
                         break;
                     }
                 }
-
                 SLT_DBG(slot, "accepted %d/%d draft tokens, new n_past = %d\n", (int) ids.size() - 1, (int) draft.size(), slot.n_past);
             }
         }
-
         SRV_DBG("%s", "run slots completed\n");
     }
 

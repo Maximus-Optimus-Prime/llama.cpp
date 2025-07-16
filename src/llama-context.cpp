@@ -100,7 +100,7 @@ llama_context::llama_context(
     }
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
-
+    cparams.g_attn = params.g_attn; // MY CODE
     cparams.op_offload = params.op_offload;
 
     const uint32_t n_ctx_per_seq = cparams.n_ctx / cparams.n_seq_max;
@@ -717,29 +717,35 @@ llm_graph_result_ptr llama_context::process_ubatch(const llama_ubatch & ubatch, 
     }
 
     // MY CODE
-    if (g_enable_attention_scores_retrieval) {
-        for (size_t l = 0; l < g_attention_tensors_per_layer.size(); ++l) {                
-            ggml_tensor * attn = g_attention_tensors_per_layer[l];
-            if (!attn || !attn->buffer) continue;
-            int64_t n_head  = attn->ne[2];
-            int64_t n_query = attn->ne[1];
-            int64_t n_key   = attn->ne[0];
-            const int64_t head_size = n_query * n_key;
-            std::vector<float> temp_buffer(n_head * head_size);
-            ggml_backend_tensor_get(attn, temp_buffer.data(), 0, temp_buffer.size() * sizeof(float));
-            AttentionLayerData layer_data;
-            layer_data.n_query = n_query;
-            layer_data.n_key = n_key;
-            layer_data.head_scores.reserve(n_head);
-            for (int64_t h = 0; h < n_head; ++h) {
-                // Efficiently copy a block for each head
-                auto start = temp_buffer.begin() + h * head_size;
-                layer_data.head_scores.emplace_back(start, start + head_size);
+    if (cparams.g_attn == 1) {
+        printf("Retrieving attention scores...\n");
+        if (g_enable_attention_scores_retrieval) {
+            for (size_t l = 0; l < g_attention_tensors_per_layer.size(); ++l) {                
+                ggml_tensor * attn = g_attention_tensors_per_layer[l];
+                if (!attn || !attn->buffer) continue;
+                int64_t n_head = attn->ne[2];
+                int64_t n_query = attn->ne[1];
+                int64_t n_key = attn->ne[0];
+                int64_t n_qk = n_query * n_key;
+                std::vector<float> temp_buffer(n_head * n_qk);
+                ggml_backend_tensor_get(attn, temp_buffer.data(), 0, temp_buffer.size() * sizeof(float));
+                AttentionLayerData layer_data;
+                layer_data.n_query = n_query;
+                layer_data.n_key = n_key;
+                layer_data.head_scores.reserve(n_head);
+                for (int64_t h = 0; h < n_head; ++h) {
+                    // Use vector constructor to copy the range directly
+                    layer_data.head_scores.emplace_back(
+                        temp_buffer.begin() + h * n_qk,
+                        temp_buffer.begin() + (h + 1) * n_qk
+                    );
+                }
+                g_attention_scores_floats.emplace_back(std::move(layer_data));
             }
-            g_attention_scores_floats.push_back(std::move(layer_data));
         }
+        g_attention_tensors_per_layer.clear();
+        g_attention_scores_floats.shrink_to_fit();
     }
-    g_attention_tensors_per_layer.clear();
     // END MY CODE
 
     ret = GGML_STATUS_SUCCESS;
@@ -2193,6 +2199,7 @@ llama_context_params llama_context_default_params() {
         /*.n_ctx                       =*/ 512,
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
+        /*.g_attn                      =*/ 0, // MY CODE
         /*.n_seq_max                   =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
