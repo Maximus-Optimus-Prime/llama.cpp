@@ -1141,9 +1141,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // MY CODE
         auto& writer = get_attention_writer();
         if (writer.get_enable_attention_scores_retrieval()) {
-            ggml_tensor *scores_copy = ggml_dup(ctx0, kq);
-            ggml_build_forward_expand(gf, scores_copy);
-            writer.get_attention_tensors_per_layer().push_back(scores_copy);
+            ggml_set_name(kq, "attention_scores");
         }
         // END MY CODE
 

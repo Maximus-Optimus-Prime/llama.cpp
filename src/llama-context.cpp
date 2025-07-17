@@ -711,6 +711,16 @@ llm_graph_result_ptr llama_context::process_ubatch(const llama_ubatch & ubatch, 
 
     res->set_inputs(&ubatch);
 
+    // MY CODE
+    if (cparams.g_attn == 1) {
+        auto& writer = get_attention_writer();
+        if (writer.is_initialized() && writer.get_enable_attention_scores_retrieval()) {
+            writer.enable_capture_for_execution();
+            ggml_backend_sched_set_eval_callback(sched.get(), attention_capture_callback, &writer);
+        }
+    }
+    // END MY CODE
+    
     const auto status = graph_compute(gf, ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -722,8 +732,8 @@ llm_graph_result_ptr llama_context::process_ubatch(const llama_ubatch & ubatch, 
     if (cparams.g_attn == 1) {
         auto& writer = get_attention_writer();
         if (writer.is_initialized() && writer.get_enable_attention_scores_retrieval()) {
-            writer.write_batch(writer.get_attention_tensors_per_layer());
-            writer.get_attention_tensors_per_layer().clear();
+            writer.finish_execution_capture();
+            ggml_backend_sched_set_eval_callback(sched.get(), nullptr, nullptr);
         }
     }
     // END MY CODE
