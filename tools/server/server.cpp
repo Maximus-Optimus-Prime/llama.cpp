@@ -33,6 +33,7 @@
 
 // MY CODE
 #include "../src/llama-graph.h"
+#include "../src/attention-writer.h" // MY CODE
 #include <fstream>
 // END MY CODE
 
@@ -2032,40 +2033,6 @@ struct server_context {
         llama_batch_free(batch);
     }
 
-    // Save attention scores to CSV file
-    json save_attention_scores() {
-        json retrieval_score;
-        const std::string bin_path = "cache/attention_scores.bin";
-        std::ofstream bin_file(bin_path, std::ios::binary);
-        if (!bin_file.is_open()) {
-            throw std::runtime_error("Failed to open attention_scores.bin for writing");
-        }
-        const int n_layer = llama_model_n_layer(model);
-        const int n_head = llama_model_n_head(model);
-        retrieval_score["metadata"] = {
-            {"n_layer", n_layer},
-            {"n_head", n_head}
-        };
-        json content = json::array();
-        for (size_t layer = 0; layer < g_attention_scores_floats.size(); ++layer) {
-            const auto& layer_data = g_attention_scores_floats[layer];
-            if (layer % n_layer == 0) {
-                content.push_back({
-                    {"n_query", layer_data.n_query},
-                    {"n_key", layer_data.n_key}
-                });
-            }
-            for (const auto& head_scores : layer_data.head_scores) {
-                bin_file.write(reinterpret_cast<const char*>(head_scores.data()), head_scores.size() * sizeof(float));
-            }
-        }
-        bin_file.close();
-        g_attention_scores_floats.clear();
-        g_attention_scores_floats.shrink_to_fit();
-        retrieval_score["content"] = std::move(content);
-        return retrieval_score;
-    }
-
     bool load_model(const common_params & params) {
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
@@ -3184,7 +3151,8 @@ struct server_context {
                             break;
                         }
                     }
-                    json data = save_attention_scores();
+                    std::string metadata_str = get_attention_writer_metadata_string();
+                    json data = json::parse(metadata_str);
                     // Write the JSON to the file with pretty formatting (indent of 2 spaces)
                     if (filename != "") {
                         file << data.dump(2);
@@ -3396,11 +3364,13 @@ struct server_context {
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
-                        if (slot.g_attn > 0) { // MY CODE
-                            g_attention_scores_floats.clear();
-                            g_attention_scores_floats.shrink_to_fit();
-                            g_enable_attention_scores_retrieval = true;
-                        } // END MY CODE
+                        // MY CODE
+                        if (slot.g_attn > 0) {
+                            auto& writer = get_attention_writer();
+                            writer.set_enable_attention_scores_retrieval(true);
+                            writer.reset();
+                        }
+                        // END MY CODE
                         slot.t_start_process_prompt = ggml_time_us();
                         slot.t_start_generation = 0;
 
@@ -3847,7 +3817,7 @@ struct server_context {
 
                 if (!process_token(result, slot)) {
                     if (slot.g_attn > 0) { // MY CODE
-                        g_enable_attention_scores_retrieval = false;
+                        get_attention_writer().set_enable_attention_scores_retrieval(false);
                     }
                     // release slot because of stop condition
                     slot.release();
@@ -5447,6 +5417,14 @@ int main(int argc, char ** argv) {
     }
 
     ctx_server.init();
+    // MY CODE
+    if (params.g_attn > 0) {
+        const int n_layer = llama_model_n_layer(ctx_server.model);
+        const int n_head = llama_model_n_head(ctx_server.model);
+        init_attention_writer(n_layer, n_head);
+        SRV_INF("Attention writer initialized: n_layer=%d, n_head=%d\n", n_layer, n_head);
+    }
+    // END MY CODE
     state.store(SERVER_STATE_READY);
 
     LOG_INF("%s: model loaded\n", __func__);

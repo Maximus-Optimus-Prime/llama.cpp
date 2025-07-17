@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
+#include "attention-writer.h" // MY CODE
 
 #include "llama-kv-cache-unified.h"
 #include "llama-kv-cache-unified-iswa.h"
@@ -11,11 +12,6 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
-
-std::vector<AttentionLayerData> g_attention_scores_floats = {};
-bool g_enable_attention_scores_retrieval = false;
-std::vector<ggml_tensor *> g_attention_tensors_per_layer = {};
-
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
@@ -1143,10 +1139,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
 
         // MY CODE
-        if (g_enable_attention_scores_retrieval) {
+        auto& writer = get_attention_writer();
+        if (writer.get_enable_attention_scores_retrieval()) {
             ggml_tensor *scores_copy = ggml_dup(ctx0, kq);
             ggml_build_forward_expand(gf, scores_copy);
-            g_attention_tensors_per_layer.push_back(scores_copy);
+            writer.get_attention_tensors_per_layer().push_back(scores_copy);
         }
         // END MY CODE
 

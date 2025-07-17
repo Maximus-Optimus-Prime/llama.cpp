@@ -12,6 +12,8 @@
 #include <limits>
 #include <stdexcept>
 
+#include "attention-writer.h" // MY CODE
+
 //
 // llama_context
 //
@@ -718,33 +720,11 @@ llm_graph_result_ptr llama_context::process_ubatch(const llama_ubatch & ubatch, 
 
     // MY CODE
     if (cparams.g_attn == 1) {
-        printf("Retrieving attention scores...\n");
-        if (g_enable_attention_scores_retrieval) {
-            for (size_t l = 0; l < g_attention_tensors_per_layer.size(); ++l) {                
-                ggml_tensor * attn = g_attention_tensors_per_layer[l];
-                if (!attn || !attn->buffer) continue;
-                int64_t n_head = attn->ne[2];
-                int64_t n_query = attn->ne[1];
-                int64_t n_key = attn->ne[0];
-                int64_t n_qk = n_query * n_key;
-                std::vector<float> temp_buffer(n_head * n_qk);
-                ggml_backend_tensor_get(attn, temp_buffer.data(), 0, temp_buffer.size() * sizeof(float));
-                AttentionLayerData layer_data;
-                layer_data.n_query = n_query;
-                layer_data.n_key = n_key;
-                layer_data.head_scores.reserve(n_head);
-                for (int64_t h = 0; h < n_head; ++h) {
-                    // Use vector constructor to copy the range directly
-                    layer_data.head_scores.emplace_back(
-                        temp_buffer.begin() + h * n_qk,
-                        temp_buffer.begin() + (h + 1) * n_qk
-                    );
-                }
-                g_attention_scores_floats.emplace_back(std::move(layer_data));
-            }
+        auto& writer = get_attention_writer();
+        if (writer.is_initialized() && writer.get_enable_attention_scores_retrieval()) {
+            writer.write_batch(writer.get_attention_tensors_per_layer());
+            writer.get_attention_tensors_per_layer().clear();
         }
-        g_attention_tensors_per_layer.clear();
-        g_attention_scores_floats.shrink_to_fit();
     }
     // END MY CODE
 

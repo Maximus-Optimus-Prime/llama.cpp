@@ -8,6 +8,7 @@ llama_add_compile_flags()
 
 add_library(llama
             ../include/llama.h
+            attention-writer.cpp # MY CODE
             llama.cpp
             llama-adapter.cpp
             llama-arch.cpp
